@@ -1,0 +1,76 @@
+name: Uptime check
+
+# Every 10 minutes: are the Hub and the website up?
+# Down → opens an issue "DOWN: ..." (GitHub emails people watching this repo).
+# Back up → comments and closes it. One email per outage, not one per check.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a test alert (opens and closes a test issue)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency: uptime
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check each address (3 tries, 20 s apart)
+        id: check
+        run: |
+          set -u
+          down=""
+          while IFS='|' read -r name url expect; do
+            [ -z "$name" ] && continue
+            ok=""
+            for try in 1 2 3; do
+              final=$(curl -s -L -o /tmp/body -w '%{http_code} %{url_effective}' --max-time 25 "$url" || echo "000 error")
+              code=${final%% *}; where=${final#* }
+              if [ "$code" = "200" ] && ! echo "$where" | grep -q localhost && grep -qi "$expect" /tmp/body; then ok=1; break; fi
+              sleep 20
+            done
+            if [ -n "$ok" ]; then echo "UP   $name"; else echo "DOWN $name (last: $code at $where)"; down="$down$name (got $code), "; fi
+          done < sites.txt
+          echo "down=${down%, }" >> "$GITHUB_OUTPUT"
+
+      - name: Open or close the outage issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOWN: ${{ steps.check.outputs.down }}
+          TEST: ${{ inputs.test_alert }}
+        run: |
+          now=$(TZ=Asia/Colombo date '+%d %b %Y %H:%M') 
+          if [ "$TEST" = "true" ]; then
+            n=$(gh issue create --title "TEST alert (please ignore)" --body "Test alert sent $now Sri Lanka time. If you got this email, alerts work." | grep -o '[0-9]*$')
+            gh issue close "$n" --comment "Test finished."
+            exit 0
+          fi
+          open=$(gh issue list --state open --label outage --json number --jq '.[0].number // empty')
+          if [ -n "$DOWN" ] && [ -z "$open" ]; then
+            gh label create outage --color B60205 --description "Site down" 2>/dev/null || true
+            gh issue create --label outage --title "DOWN: $DOWN" --body "Noticed $now Sri Lanka time. Not reachable after 3 tries: $DOWN. This closes by itself when it's back."
+          elif [ -z "$DOWN" ] && [ -n "$open" ]; then
+            gh issue close "$open" --comment "Back up at $now Sri Lanka time."
+          fi
+
+      - name: Weekly heartbeat (keeps the schedule switched on)
+        if: github.event_name == 'schedule'
+        run: |
+          # GitHub pauses schedules in repos with no commits for 60 days.
+          week=$(date -u +%G-W%V)
+          if [ "$(cat heartbeat.txt 2>/dev/null)" != "$week" ]; then
+            echo "$week" > heartbeat.txt
+            git config user.name "uptime-bot"; git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add heartbeat.txt && git commit -m "Heartbeat $week" && git push
+          fi
